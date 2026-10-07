@@ -1,0 +1,204 @@
+import ast
+import os
+from typing import Dict, List, Set, Tuple, Optional, Any
+import networkx as nx
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+
+class CodeGraphBuilder(ast.NodeVisitor):
+    def __init__(self, module_name: str, file_node_id: str):
+        self.module_name = module_name
+        self.file_node_id = file_node_id
+        self.current_function: Optional[str] = None
+        self.calls: List[Tuple[str, str]] = []
+        self.imported_files: Set[str] = set()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        old_function = self.current_function
+        self.current_function = f"func:{self.module_name}.{node.name}"
+        self.generic_visit(node)
+        self.current_function = old_function
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Call(self, node: ast.Call):
+        if self.current_function is None:
+            self.generic_visit(node)
+            return
+
+        callee = self._resolve_call(node.func)
+        if callee is not None:
+            self.calls.append((self.current_function, callee))
+
+        self.generic_visit(node)
+
+    def visit_Import(self, node: ast.Import):
+        for alias in node.names:
+            mod_name = alias.name.split(".")[0]
+            file_node = self._module_to_file_node(mod_name)
+            if file_node is not None:
+                self.imported_files.add(file_node)
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom):
+        if node.module is None:
+            self.generic_visit(node)
+            return
+        mod_name = node.module.split(".")[0]
+        file_node = self._module_to_file_node(mod_name)
+        if file_node is not None:
+            self.imported_files.add(file_node)
+        self.generic_visit(node)
+
+    def _resolve_call(self, func_node: ast.AST) -> Optional[str]:
+        if isinstance(func_node, ast.Name):
+            return f"func:{self.module_name}.{func_node.id}"
+        elif isinstance(func_node, ast.Attribute):
+            parts = []
+            node_ = func_node
+            while isinstance(node_, ast.Attribute):
+                parts.append(node_.attr)
+                node_ = node_.value
+            if isinstance(node_, ast.Name):
+                parts.append(node_.id)
+                parts.reverse()
+                return f"func:{self.module_name}.{'.'.join(parts)}"
+        return None
+
+    def _module_to_file_node(self, mod_name: str) -> Optional[str]:
+        return f"file:{mod_name}"
+
+
+def build_code_graph_for_file(file_path: str, module_name: str) -> Tuple[str, List[Tuple[str, str]], Set[str]]:
+    with open(file_path, "r", encoding="utf-8") as f:
+        source = f.read()
+    tree = ast.parse(source, filename=file_path)
+    file_node_id = f"file:{module_name}"
+    visitor = CodeGraphBuilder(module_name, file_node_id)
+    visitor.visit(tree)
+    return file_node_id, visitor.calls, visitor.imported_files
+
+
+def build_repo_code_graph(repo_dir: str) -> nx.DiGraph:
+    G = nx.DiGraph()
+    py_files = []
+
+    for root, _, files in os.walk(repo_dir):
+        for fname in files:
+            if fname.endswith(".py"):
+                py_files.append(os.path.join(root, fname))
+
+    repo_dir_abs = os.path.abspath(repo_dir)
+
+    file_info = []
+    for full_path in py_files:
+        rel_path = os.path.relpath(full_path, repo_dir_abs)
+        module_name = rel_path.replace(os.sep, ".").rsplit(".py", 1)[0]
+        file_info.append((full_path, module_name))
+
+    module_prefix_to_file = {}
+    for full_path, module_name in file_info:
+        parts = module_name.split(".")
+        for i in range(1, len(parts)+1):
+            prefix = ".".join(parts[:i])
+            module_prefix_to_file[prefix] = f"file:{module_name}"
+
+    for full_path, module_name in file_info:
+        file_node_id, calls, imported_modules = build_code_graph_for_file(full_path, module_name)
+
+        G.add_node(file_node_id, type="file", module=module_name, path=full_path)
+
+        for caller, callee in calls:
+            if not G.has_node(caller):
+                parts = caller[len("func:"):].rsplit(".", 1)
+                if len(parts) == 2:
+                    mod, func_name = parts
+                    G.add_node(caller, type="function", module=mod, name=func_name)
+            if not G.has_node(callee):
+                parts = callee[len("func:"):].rsplit(".", 1)
+                if len(parts) == 2:
+                    mod, func_name = parts
+                    G.add_node(callee, type="function", module=mod, name=func_name)
+            G.add_edge(caller, callee, type="CALLS")
+
+        for mod_prefix in imported_modules:
+            target_file = module_prefix_to_file.get(mod_prefix)
+            if target_file is None:
+                target_file = f"file:{mod_prefix}"
+            G.add_edge(file_node_id, target_file, type="IMPORTS")
+
+    return G
+
+
+def extract_function_texts(repo_dir: str) -> Dict[str, Dict[str, Any]]:
+    func_info = {}
+    for root, _, files in os.walk(repo_dir):
+        for fname in files:
+            if not fname.endswith(".py"):
+                continue
+            full_path = os.path.join(root, fname)
+            rel_path = os.path.relpath(full_path, os.path.abspath(repo_dir))
+            module_name = rel_path.replace(os.sep, ".").rsplit(".py", 1)[0]
+
+            with open(full_path, "r", encoding="utf-8") as f:
+                source = f.read()
+            tree = ast.parse(source, filename=full_path)
+
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    func_id = f"func:{module_name}.{node.name}"
+                    sig = f"def {node.name}(...):"
+                    doc = ast.get_docstring(node)
+                    func_info[func_id] = {
+                        "module": module_name,
+                        "name": node.name,
+                        "signature": sig,
+                        "docstring": doc,
+                        "file": full_path,
+                    }
+    return func_info
+
+
+def rank_functions_for_bug(
+    G: nx.DiGraph,
+    func_info: Dict[str, Dict[str, Any]],
+    bug_description: str,
+    top_k: int = 5,
+    alpha: float = 0.7,
+) -> List[str]:
+    func_ids = [fid for fid in func_info if fid in G.nodes()]
+    if len(func_ids) == 0:
+        return []
+
+    texts = []
+    for fid in func_ids:
+        info = func_info[fid]
+        text_parts = [info["signature"]]
+        if info["docstring"]:
+            text_parts.append(info["docstring"])
+        texts.append("\n".join(text_parts))
+
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    bug_emb = model.encode([bug_description], convert_to_numpy=True, normalize_embeddings=True)
+    func_embs = model.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
+
+    sims = (bug_emb @ func_embs.T).flatten()
+
+    call_subgraph = G.subgraph([n for n, d in G.nodes(data=True) if d.get("type") == "function"]).copy()
+    edges_to_keep = [(u, v) for u, v, d in call_subgraph.edges(data=True) if d.get("type") == "CALLS"]
+    call_subgraph = call_subgraph.edge_subgraph(edges_to_keep).copy()
+
+    if len(call_subgraph.nodes()) == 0:
+        pr = {fid: 0.0 for fid in func_ids}
+    else:
+        pr = nx.pagerank(call_subgraph, max_iter=100)
+
+    pr_scores = np.array([pr.get(fid, 0.0) for fid in func_ids])
+    if pr_scores.max() > 0:
+        pr_scores = pr_scores / pr_scores.max()
+
+    final_scores = alpha * sims + (1 - alpha) * pr_scores
+    top_indices = np.argsort(final_scores)[::-1][:top_k]
+    top_funcs = [func_ids[i] for i in top_indices]
+    return top_funcs
